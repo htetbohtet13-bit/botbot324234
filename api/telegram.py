@@ -126,18 +126,29 @@ def edit_welcome(bot_token, chat_id, message, command, database_url):
         send_message(bot_token, chat_id, replies[result])
 
 
-def send_saved_welcome(bot_token, chat_id, database_url):
-    if not database_url:
-        return False
+def handle_start(bot_token, chat_id, message_date, database_url):
+    messages = []
+    if database_url:
+        with connect_database(database_url) as connection:
+            connection.execute(
+                """INSERT INTO public.telegram_subscribers AS subscriber
+                       (chat_id, first_started_at, last_started_at)
+                   VALUES (%s, to_timestamp(%s), to_timestamp(%s))
+                   ON CONFLICT (chat_id) DO UPDATE SET
+                       first_started_at = LEAST(subscriber.first_started_at, EXCLUDED.first_started_at),
+                       last_started_at = GREATEST(subscriber.last_started_at, EXCLUDED.last_started_at)""",
+                (chat_id, message_date, message_date),
+            )
+            row = connection.execute(
+                "SELECT published_ids FROM public.telegram_welcome WHERE owner_id = %s", (OWNER_ID,)
+            ).fetchone()
+        if row:
+            messages = row[0]
 
-    with connect_database(database_url) as connection:
-        row = connection.execute(
-            "SELECT published_ids FROM public.telegram_welcome WHERE owner_id = %s", (OWNER_ID,)
-        ).fetchone()
-    if row is None:
-        return False
+    if not messages:
+        send_start_messages(bot_token, chat_id)
+        return
 
-    messages = row[0]
     for start in range(0, len(messages), 100):
         body = {
             "chat_id": chat_id,
@@ -145,7 +156,6 @@ def send_saved_welcome(bot_token, chat_id, database_url):
             "message_ids": messages[start:start + 100],
         }
         send_telegram(bot_token, "copyMessages", json.dumps(body).encode())
-    return bool(messages)
 
 
 def send_start_messages(bot_token, chat_id):
@@ -205,8 +215,7 @@ class handler(BaseHTTPRequestHandler):
             database_url = os.environ.get("DATABASE_URL")
             try:
                 if command == "/start":
-                    if not send_saved_welcome(bot_token, chat["id"], database_url):
-                        send_start_messages(bot_token, chat["id"])
+                    handle_start(bot_token, chat["id"], message["date"], database_url)
                 elif message.get("from", {}).get("id") == OWNER_ID:
                     edit_welcome(bot_token, chat["id"], message, command, database_url)
             except psycopg.Error:
