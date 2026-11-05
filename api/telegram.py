@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from secrets import token_hex
 from time import sleep
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import psycopg
@@ -107,6 +107,24 @@ def send_telegram(bot_token, method, body, content_type="application/json"):
     if not result.get("ok"):
         raise URLError("Telegram did not confirm the request")
     return result["result"]
+
+
+def check_configuration(bot_token, database_url):
+    bot = send_telegram(bot_token, "getMe", b"{}")
+    report = {"bot_id": bot["id"], "bot_username": bot.get("username"), "database": "missing DATABASE_URL"}
+    if database_url:
+        try:
+            with connect_database(database_url) as connection:
+                tables = ("telegram_welcome", "telegram_subscribers", "telegram_menu_buttons", "telegram_menu_drafts")
+                missing = []
+                for table in tables:
+                    if connection.execute("SELECT to_regclass(%s)", (f"public.{table}",)).fetchone()[0] is None:
+                        missing.append(table)
+                report["database"] = "connected"
+                report["missing_tables"] = missing
+        except psycopg.Error as error:
+            report["database"] = f"connection failed ({type(error).__name__}, SQLSTATE {error.sqlstate})"
+    return report
 
 
 def send_message(bot_token, chat_id, text, reply_markup=None):
@@ -436,10 +454,27 @@ class handler(BaseHTTPRequestHandler):
             return
 
         try:
+            if update.get("diagnostic") is True:
+                body = json.dumps(check_configuration(bot_token, os.environ.get("DATABASE_URL"))).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             handle_update(bot_token, update, os.environ.get("DATABASE_URL"))
         except psycopg.Error:
             self.send_error(502, "Bot database is unavailable")
             return
+        except HTTPError as error:
+            if error.code != 403:
+                try:
+                    description = json.load(error).get("description", "Telegram request failed")
+                except (ValueError, OSError):
+                    description = "Telegram request failed"
+                description = str(description).replace(bot_token, "[redacted]")
+                self.send_error(502, f"Telegram HTTP {error.code}: {description}")
+                return
         except (URLError, TimeoutError) as error:
             if getattr(error, "code", None) != 403:
                 self.send_error(502, "Telegram could not deliver the reply")
