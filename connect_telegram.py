@@ -33,7 +33,7 @@ def main():
     request = Request(
         f"https://api.telegram.org/bot{token}/setWebhook",
         data=json.dumps(
-            {"url": webhook_url, "secret_token": secret, "allowed_updates": ["message", "callback_query"]}
+            {"url": webhook_url, "secret_token": secret, "allowed_updates": ["message"]}
         ).encode(),
         headers={"Content-Type": "application/json"},
     )

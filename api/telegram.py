@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from secrets import token_hex
 from time import sleep
-from urllib.error import HTTPError, URLError
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 import psycopg
@@ -76,17 +76,21 @@ def update_welcome(connection, action, message_id):
         )
         return "published"
 
-    if editing and message_id > started and message_id not in draft:
-        connection.execute(
-            "UPDATE public.telegram_welcome SET draft_ids = %s WHERE owner_id = %s",
-            (sorted([*draft, message_id]), OWNER_ID),
-        )
-    elif published_from < message_id < published_to and message_id not in published:
+    if editing and message_id > started:
+        if message_id not in draft:
+            connection.execute(
+                "UPDATE public.telegram_welcome SET draft_ids = %s WHERE owner_id = %s",
+                (sorted([*draft, message_id]), OWNER_ID),
+            )
+        return "added"
+    elif published_from < message_id < published_to:
         # Telegram can deliver a message sent before /done after the publish transaction.
-        connection.execute(
-            "UPDATE public.telegram_welcome SET published_ids = %s WHERE owner_id = %s",
-            (sorted([*published, message_id]), OWNER_ID),
-        )
+        if message_id not in published:
+            connection.execute(
+                "UPDATE public.telegram_welcome SET published_ids = %s WHERE owner_id = %s",
+                (sorted([*published, message_id]), OWNER_ID),
+            )
+        return "added"
 
 
 def send_telegram(bot_token, method, body, content_type="application/json"):
@@ -113,17 +117,13 @@ def send_message(bot_token, chat_id, text, reply_markup=None):
 
 
 def copy_messages(bot_token, chat_id, source_chat_id, message_ids):
-    last_message_id = None
     for start in range(0, len(message_ids), 100):
         body = {
             "chat_id": chat_id,
             "from_chat_id": source_chat_id,
             "message_ids": message_ids[start:start + 100],
         }
-        copied = send_telegram(bot_token, "copyMessages", json.dumps(body).encode())
-        if copied:
-            last_message_id = copied[-1]["message_id"]
-    return last_message_id
+        send_telegram(bot_token, "copyMessages", json.dumps(body).encode())
 
 
 def edit_welcome(connection, message_id, command):
@@ -135,39 +135,34 @@ def edit_welcome(connection, message_id, command):
         "empty": "Send at least one welcome message, then send /done again.",
         "no_draft": "Send /setwelcome to start a new welcome.",
     }
-    return replies.get(result)
+    return result is not None, replies.get(result)
 
 
-def load_menu_buttons(connection):
+def load_buttons(connection):
     return connection.execute("SELECT id, label FROM public.telegram_menu_buttons ORDER BY id").fetchall()
 
 
-def send_menu(bot_token, chat_id, buttons, message_id=None):
-    for start in range(0, len(buttons), 50):
-        keyboard = [
-            [{"text": label, "callback_data": f"menu:{button_id}"}]
-            for button_id, label in buttons[start:start + 50]
-        ]
-        markup = {"inline_keyboard": keyboard}
-        if start == 0 and message_id is not None:
-            body = {"chat_id": chat_id, "message_id": message_id, "reply_markup": markup}
-            send_telegram(bot_token, "editMessageReplyMarkup", json.dumps(body).encode())
-        else:
-            send_message(bot_token, chat_id, "Choose an option", markup)
+def button_keyboard(buttons):
+    return {
+        "keyboard": [[{"text": label}] for _, label in buttons],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "one_time_keyboard": False,
+    }
 
 
-def show_menu(bot_token, chat_id, database_url):
+def show_buttons(bot_token, chat_id, database_url):
     buttons = []
     if database_url:
         with connect_database(database_url) as connection:
-            buttons = load_menu_buttons(connection)
+            buttons = load_buttons(connection)
     if buttons:
-        send_menu(bot_token, chat_id, buttons)
+        send_message(bot_token, chat_id, "Choose an option", button_keyboard(buttons))
     else:
-        send_message(bot_token, chat_id, "There are no inline buttons yet.")
+        send_message(bot_token, chat_id, "There are no buttons yet.", {"remove_keyboard": True})
 
 
-def save_menu_button(connection, label, message_date, update_id, *, reply_text="", source=None):
+def save_button(connection, label, message_date, update_id, *, reply_text="", source=None):
     chat_id, started, finished, message_ids = source or (None, None, None, [])
     result = connection.execute(
         """INSERT INTO public.telegram_menu_buttons AS button
@@ -187,7 +182,7 @@ def save_menu_button(connection, label, message_date, update_id, *, reply_text="
     return f"The {label} button already has a newer reply."
 
 
-def add_menu_button(connection, chat_id, message, update_id, draft, is_owner):
+def add_button(connection, chat_id, message, update_id, draft, is_owner):
     first_line, _, reply_text = message["text"].partition("\n")
     heading = first_line.split(maxsplit=1)
     label = heading[1].strip() if len(heading) > 1 else ""
@@ -195,8 +190,10 @@ def add_menu_button(connection, chat_id, message, update_id, draft, is_owner):
         return "Send /addbutton Support, then send the button's messages and finish with /done."
     if len(label) > 64:
         return "Use a button label with at most 64 characters."
+    if label.startswith("/"):
+        return "Use a button label that starts with a word or emoji."
     if reply_text.strip():
-        return save_menu_button(connection, label, message["date"], update_id, reply_text=reply_text)
+        return save_button(connection, label, message["date"], update_id, reply_text=reply_text)
 
     message_id = message["message_id"]
     if is_owner:
@@ -221,7 +218,7 @@ def add_menu_button(connection, chat_id, message, update_id, draft, is_owner):
     return f"Send the messages for {label} in order, then send /done."
 
 
-def update_menu_draft(connection, chat_id, message, update_id, command, draft):
+def update_button_draft(connection, chat_id, message, update_id, command, draft):
     message_id = message["message_id"]
     if draft:
         label, started, finished, message_ids = draft
@@ -232,7 +229,7 @@ def update_menu_draft(connection, chat_id, message, update_id, command, draft):
                 ready = [item for item in message_ids if item < message_id]
                 if not ready:
                     return True, "Send at least one message for the button, then send /done again."
-                reply = save_menu_button(
+                reply = save_button(
                     connection, label, message["date"], update_id, source=(chat_id, started, message_id, ready)
                 )
                 connection.execute(
@@ -261,72 +258,55 @@ def update_menu_draft(connection, chat_id, message, update_id, command, draft):
 
 
 def edit_admin(bot_token, chat_id, message, update_id, command, database_url, is_owner):
-    edit_commands = ("/addbutton", "/addmenu", "/setwelcome", "/done")
+    edit_commands = ("/addbutton", "/setwelcome", "/done")
     if command not in edit_commands and not any(field in message for field in COPYABLE_FIELDS):
-        return
+        return False
     if not database_url:
         if command in edit_commands:
             send_message(bot_token, chat_id, "Connect Neon to the Vercel project first.")
-        return
+        return command in edit_commands
 
     with connect_database(database_url) as connection:
-        # Serialize edits in this admin's chat, including switching between welcome and menu drafts.
+        # Serialize edits in this admin's chat, including switching between welcome and button drafts.
         connection.execute("SELECT pg_advisory_xact_lock(%s)", (chat_id,))
         draft = connection.execute(
             """SELECT label, started_message_id, done_message_id, message_ids
                FROM public.telegram_menu_drafts WHERE chat_id = %s""",
             (chat_id,),
         ).fetchone()
-        if command in ("/addbutton", "/addmenu"):
-            reply = add_menu_button(connection, chat_id, message, update_id, draft, is_owner)
+        handled = True
+        if command == "/addbutton":
+            reply = add_button(connection, chat_id, message, update_id, draft, is_owner)
         elif command == "/setwelcome":
             if draft and message["message_id"] <= (draft[2] or draft[1]):
                 reply = None
             elif draft and draft[2] is None:
                 reply = "Finish the button draft with /done before editing the welcome."
             else:
-                reply = edit_welcome(connection, message["message_id"], command)
+                handled, reply = edit_welcome(connection, message["message_id"], command)
         else:
-            handled, reply = update_menu_draft(connection, chat_id, message, update_id, command, draft)
+            handled, reply = update_button_draft(connection, chat_id, message, update_id, command, draft)
             if not handled and is_owner:
-                reply = edit_welcome(connection, message["message_id"], command)
+                handled, reply = edit_welcome(connection, message["message_id"], command)
             elif not handled and command == "/done":
                 reply = "Send /addbutton followed by a button name to start a draft."
     if reply:
         send_message(bot_token, chat_id, reply)
+    return handled or command in edit_commands
 
 
-def handle_menu_callback(bot_token, callback, database_url):
-    data = callback.get("data", "")
-    chat = callback.get("message", {}).get("chat", {})
-    if chat.get("type") != "private" or not data.startswith("menu:"):
+def reply_to_button(bot_token, chat_id, text, database_url):
+    if not text or not database_url:
         return
-
-    try:
-        send_telegram(bot_token, "answerCallbackQuery", json.dumps({"callback_query_id": callback["id"]}).encode())
-    except HTTPError as error:
-        if error.code != 400:
-            raise
-
-    button_id = data.removeprefix("menu:")
-    if not (button_id.isascii() and button_id.isdecimal() and len(button_id) <= 19):
-        return
-    button_id = int(button_id)
-    if not 0 < button_id <= 2**63 - 1:
-        return
-
-    row = None
-    if database_url:
-        with connect_database(database_url) as connection:
-            row = connection.execute(
-                "SELECT reply_text, source_chat_id, message_ids FROM public.telegram_menu_buttons WHERE id = %s",
-                (button_id,),
-            ).fetchone()
+    with connect_database(database_url) as connection:
+        row = connection.execute(
+            "SELECT reply_text, source_chat_id, message_ids FROM public.telegram_menu_buttons WHERE label = %s",
+            (text,),
+        ).fetchone()
     if row and row[2]:
-        copy_messages(bot_token, chat["id"], row[1], row[2])
-    else:
-        reply = row[0] if row else "That button is unavailable. Send /buttons to refresh."
-        send_message(bot_token, chat["id"], reply)
+        copy_messages(bot_token, chat_id, row[1], row[2])
+    elif row:
+        send_message(bot_token, chat_id, row[0])
 
 
 def handle_start(bot_token, chat_id, message_date, database_url):
@@ -346,20 +326,21 @@ def handle_start(bot_token, chat_id, message_date, database_url):
             row = connection.execute(
                 "SELECT published_ids FROM public.telegram_welcome WHERE owner_id = %s", (OWNER_ID,)
             ).fetchone()
-            buttons = load_menu_buttons(connection)
+            buttons = load_buttons(connection)
         if row:
             messages = row[0]
 
     if not messages:
-        message_id = send_start_messages(bot_token, chat_id)
+        markup = button_keyboard(buttons) if buttons else {"remove_keyboard": True}
+        send_start_messages(bot_token, chat_id, markup)
     else:
-        message_id = copy_messages(bot_token, chat_id, OWNER_ID, messages)
-    if buttons:
-        sleep(1)
-        send_menu(bot_token, chat_id, buttons, message_id)
+        copy_messages(bot_token, chat_id, OWNER_ID, messages)
+        if buttons:
+            sleep(1)
+            send_message(bot_token, chat_id, "Choose an option", button_keyboard(buttons))
 
 
-def send_start_messages(bot_token, chat_id):
+def send_start_messages(bot_token, chat_id, reply_markup):
     boundary = token_hex(16)
     document = b"".join(
         (
@@ -376,16 +357,15 @@ def send_start_messages(bot_token, chat_id):
     send_telegram(bot_token, "sendDocument", document, f"multipart/form-data; boundary={boundary}")
     sleep(1)
     link = json.dumps(
-        {"chat_id": chat_id, "text": GAME_LINK_TEXT, "link_preview_options": {"is_disabled": True}}
+        {
+            "chat_id": chat_id, "text": GAME_LINK_TEXT,
+            "link_preview_options": {"is_disabled": True}, "reply_markup": reply_markup,
+        }
     ).encode()
-    return send_telegram(bot_token, "sendMessage", link)["message_id"]
+    send_telegram(bot_token, "sendMessage", link)
 
 
 def handle_update(bot_token, update, database_url):
-    if "callback_query" in update:
-        handle_menu_callback(bot_token, update["callback_query"], database_url)
-        return
-
     message = update.get("message", {})
     chat = message.get("chat", {})
     if chat.get("type") != "private":
@@ -397,15 +377,19 @@ def handle_update(bot_token, update, database_url):
     chat_id = chat["id"]
     if command == "/start":
         handle_start(bot_token, chat_id, message["date"], database_url)
-    elif command in ("/buttons", "/menu"):
-        show_menu(bot_token, chat_id, database_url)
+    elif command == "/buttons":
+        show_buttons(bot_token, chat_id, database_url)
     else:
         is_owner = user_id == OWNER_ID
         admin_ids = {item.strip() for item in os.environ.get("TELEGRAM_ADMIN_IDS", "").split(",")}
         if command == "/setwelcome" and not is_owner:
             return
+        if command.startswith("/") and command not in ("/addbutton", "/setwelcome", "/done"):
+            return
         if is_owner or (user_id is not None and str(user_id) in admin_ids):
-            edit_admin(bot_token, chat_id, message, update["update_id"], command, database_url, is_owner)
+            if edit_admin(bot_token, chat_id, message, update["update_id"], command, database_url, is_owner):
+                return
+        reply_to_button(bot_token, chat_id, message.get("text"), database_url)
 
 
 class handler(BaseHTTPRequestHandler):
