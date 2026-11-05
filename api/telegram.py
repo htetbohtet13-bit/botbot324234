@@ -116,14 +116,23 @@ def send_message(bot_token, chat_id, text, reply_markup=None):
     return send_telegram(bot_token, "sendMessage", json.dumps(body).encode())
 
 
-def copy_messages(bot_token, chat_id, source_chat_id, message_ids):
-    for start in range(0, len(message_ids), 100):
+def copy_messages(bot_token, chat_id, source_chat_id, message_ids, reply_markup=None):
+    batch_ids = message_ids[:-1] if reply_markup else message_ids
+    for start in range(0, len(batch_ids), 100):
         body = {
             "chat_id": chat_id,
             "from_chat_id": source_chat_id,
-            "message_ids": message_ids[start:start + 100],
+            "message_ids": batch_ids[start:start + 100],
         }
         send_telegram(bot_token, "copyMessages", json.dumps(body).encode())
+    if reply_markup and message_ids:
+        body = {
+            "chat_id": chat_id,
+            "from_chat_id": source_chat_id,
+            "message_id": message_ids[-1],
+            "reply_markup": reply_markup,
+        }
+        send_telegram(bot_token, "copyMessage", json.dumps(body).encode())
 
 
 def edit_welcome(connection, message_id, command):
@@ -153,11 +162,19 @@ def button_keyboard(buttons):
 
 def show_buttons(bot_token, chat_id, database_url):
     buttons = []
+    welcome = None
     if database_url:
         with connect_database(database_url) as connection:
             buttons = load_buttons(connection)
+            welcome = connection.execute(
+                "SELECT published_ids FROM public.telegram_welcome WHERE owner_id = %s", (OWNER_ID,)
+            ).fetchone()
     if buttons:
-        send_message(bot_token, chat_id, "Choose an option", button_keyboard(buttons))
+        markup = button_keyboard(buttons)
+        if welcome and welcome[0]:
+            copy_messages(bot_token, chat_id, OWNER_ID, welcome[0][-1:], markup)
+        else:
+            send_message(bot_token, chat_id, GAME_LINK_TEXT, markup)
     else:
         send_message(bot_token, chat_id, "There are no buttons yet.", {"remove_keyboard": True})
 
@@ -330,14 +347,11 @@ def handle_start(bot_token, chat_id, message_date, database_url):
         if row:
             messages = row[0]
 
+    markup = button_keyboard(buttons) if buttons else {"remove_keyboard": True}
     if not messages:
-        markup = button_keyboard(buttons) if buttons else {"remove_keyboard": True}
         send_start_messages(bot_token, chat_id, markup)
     else:
-        copy_messages(bot_token, chat_id, OWNER_ID, messages)
-        if buttons:
-            sleep(1)
-            send_message(bot_token, chat_id, "Choose an option", button_keyboard(buttons))
+        copy_messages(bot_token, chat_id, OWNER_ID, messages, markup)
 
 
 def send_start_messages(bot_token, chat_id, reply_markup):
