@@ -29,6 +29,16 @@ COPYABLE_FIELDS = (
     "location", "photo", "sticker", "venue", "video", "video_note", "voice",
 )
 
+class TelegramRequestError(URLError):
+    def __init__(self, code, description):
+        super().__init__(description)
+        self.code = code
+
+
+class SavedContentUnavailable(Exception):
+    pass
+
+
 def connect_database(database_url):
     return psycopg.connect(database_url, connect_timeout=10, prepare_threshold=None)
 
@@ -99,7 +109,15 @@ def send_telegram(bot_token, method, body, content_type="application/json"):
         data=body,
         headers={"Content-Type": content_type},
     )
-    with urlopen(request, timeout=8) as response:
+    try:
+        response = urlopen(request, timeout=8)
+    except HTTPError as error:
+        try:
+            description = json.load(error).get("description", "Telegram request failed")
+        except (ValueError, OSError):
+            description = "Telegram request failed"
+        raise TelegramRequestError(error.code, str(description).replace(bot_token, "[redacted]")) from None
+    with response:
         try:
             result = json.load(response)
         except ValueError:
@@ -135,6 +153,19 @@ def send_message(bot_token, chat_id, text, reply_markup=None):
 
 
 def copy_messages(bot_token, chat_id, source_chat_id, message_ids, reply_markup=None):
+    try:
+        send_copied_messages(bot_token, chat_id, source_chat_id, message_ids, reply_markup)
+    except TelegramRequestError as error:
+        missing_errors = (
+            "there are no messages to forward", "message to copy not found",
+            "message to forward not found", "message can't be copied",
+        )
+        if error.code == 400 and any(text in str(error.reason).lower() for text in missing_errors):
+            raise SavedContentUnavailable from None
+        raise
+
+
+def send_copied_messages(bot_token, chat_id, source_chat_id, message_ids, reply_markup):
     batch_ids = message_ids[:-1] if reply_markup else message_ids
     for start in range(0, len(batch_ids), 100):
         body = {
@@ -142,7 +173,9 @@ def copy_messages(bot_token, chat_id, source_chat_id, message_ids, reply_markup=
             "from_chat_id": source_chat_id,
             "message_ids": batch_ids[start:start + 100],
         }
-        send_telegram(bot_token, "copyMessages", json.dumps(body).encode())
+        copied = send_telegram(bot_token, "copyMessages", json.dumps(body).encode())
+        if len(copied) != len(body["message_ids"]):
+            raise SavedContentUnavailable
     if reply_markup and message_ids:
         body = {
             "chat_id": chat_id,
@@ -190,7 +223,10 @@ def show_buttons(bot_token, chat_id, database_url):
     if buttons:
         markup = button_keyboard(buttons)
         if welcome and welcome[0]:
-            copy_messages(bot_token, chat_id, OWNER_ID, welcome[0][-1:], markup)
+            try:
+                copy_messages(bot_token, chat_id, OWNER_ID, welcome[0][-1:], markup)
+            except SavedContentUnavailable:
+                send_message(bot_token, chat_id, GAME_LINK_TEXT, markup)
         else:
             send_message(bot_token, chat_id, GAME_LINK_TEXT, markup)
     else:
@@ -338,9 +374,14 @@ def reply_to_button(bot_token, chat_id, text, database_url):
             (text,),
         ).fetchone()
     if row and row[2]:
-        copy_messages(bot_token, chat_id, row[1], row[2])
-    elif row:
+        try:
+            copy_messages(bot_token, chat_id, row[1], row[2])
+        except SavedContentUnavailable:
+            send_message(bot_token, chat_id, "This button's content is being updated.")
+    elif row and row[0]:
         send_message(bot_token, chat_id, row[0])
+    elif row:
+        send_message(bot_token, chat_id, "This button's content is being updated.")
 
 
 def handle_start(bot_token, chat_id, message_date, database_url):
@@ -368,7 +409,10 @@ def handle_start(bot_token, chat_id, message_date, database_url):
     if not messages:
         send_start_messages(bot_token, chat_id, markup)
     else:
-        copy_messages(bot_token, chat_id, OWNER_ID, messages, markup)
+        try:
+            copy_messages(bot_token, chat_id, OWNER_ID, messages, markup)
+        except SavedContentUnavailable:
+            send_start_messages(bot_token, chat_id, markup)
 
 
 def send_start_messages(bot_token, chat_id, reply_markup):
@@ -466,14 +510,9 @@ class handler(BaseHTTPRequestHandler):
         except psycopg.Error:
             self.send_error(502, "Bot database is unavailable")
             return
-        except HTTPError as error:
+        except TelegramRequestError as error:
             if error.code != 403:
-                try:
-                    description = json.load(error).get("description", "Telegram request failed")
-                except (ValueError, OSError):
-                    description = "Telegram request failed"
-                description = str(description).replace(bot_token, "[redacted]")
-                self.send_error(502, f"Telegram HTTP {error.code}: {description}")
+                self.send_error(502, f"Telegram HTTP {error.code}: {error.reason}")
                 return
         except (URLError, TimeoutError) as error:
             if getattr(error, "code", None) != 403:
