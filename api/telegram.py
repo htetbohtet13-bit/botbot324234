@@ -43,6 +43,15 @@ def connect_database(database_url):
     return psycopg.connect(database_url, connect_timeout=10, prepare_threshold=None)
 
 
+def database_error_summary(error):
+    summary = f"{type(error).__name__} (SQLSTATE {error.sqlstate or 'unavailable'})"
+    if error.diag.table_name:
+        summary += f", table {error.diag.table_name}"
+    if error.diag.column_name:
+        summary += f", column {error.diag.column_name}"
+    return summary
+
+
 def update_welcome(connection, action, message_id):
     if action == "start":
         connection.execute(
@@ -141,7 +150,7 @@ def check_configuration(bot_token, database_url):
                 report["database"] = "connected"
                 report["missing_tables"] = missing
         except psycopg.Error as error:
-            report["database"] = f"connection failed ({type(error).__name__}, SQLSTATE {error.sqlstate})"
+            report["database"] = f"check failed: {database_error_summary(error)}"
     return report
 
 
@@ -507,8 +516,8 @@ class handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
             handle_update(bot_token, update, os.environ.get("DATABASE_URL"))
-        except psycopg.Error:
-            self.send_error(502, "Bot database is unavailable")
+        except psycopg.Error as error:
+            self.send_error(502, f"Database error: {database_error_summary(error)}")
             return
         except TelegramRequestError as error:
             if error.code != 403:
