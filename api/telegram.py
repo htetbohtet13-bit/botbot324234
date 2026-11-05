@@ -201,8 +201,7 @@ def save_button(connection, label, message_date, update_id, *, reply_text="", so
 
 def add_button(connection, chat_id, message, update_id, draft, is_owner):
     first_line, _, reply_text = message["text"].partition("\n")
-    heading = first_line.split(maxsplit=1)
-    label = heading[1].strip() if len(heading) > 1 else ""
+    label = first_line.lstrip().removeprefix("/addbutton").strip()
     if not label:
         return "Send /addbutton Support, then send the button's messages and finish with /done."
     if len(label) > 64:
@@ -385,8 +384,11 @@ def handle_update(bot_token, update, database_url):
     if chat.get("type") != "private":
         return
 
-    words = message.get("text", "").split(maxsplit=1)
+    text = message.get("text", "").lstrip()
+    words = text.split(maxsplit=1)
     command = words[0] if words else ""
+    if text.startswith("/addbutton"):
+        command = "/addbutton"
     user_id = message.get("from", {}).get("id")
     chat_id = chat["id"]
     if command == "/start":
