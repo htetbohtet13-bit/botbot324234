@@ -220,6 +220,15 @@ def button_keyboard(buttons):
     }
 
 
+def show_user_count(bot_token, chat_id, database_url):
+    if not database_url:
+        send_message(bot_token, chat_id, "Connect Neon to the Vercel project first.")
+        return
+    with connect_database(database_url) as connection:
+        total = connection.execute("SELECT COUNT(*) FROM public.telegram_subscribers").fetchone()[0]
+    send_message(bot_token, chat_id, f"Total users: {total:,}")
+
+
 def show_buttons(bot_token, chat_id, database_url):
     buttons = []
     welcome = None
@@ -469,11 +478,16 @@ def handle_update(bot_token, update, database_url):
     else:
         is_owner = user_id == OWNER_ID
         admin_ids = {item.strip() for item in os.environ.get("TELEGRAM_ADMIN_IDS", "").split(",")}
+        is_admin = is_owner or (user_id is not None and str(user_id) in admin_ids)
+        if command == "/count":
+            if is_admin:
+                show_user_count(bot_token, chat_id, database_url)
+            return
         if command == "/setwelcome" and not is_owner:
             return
         if command.startswith("/") and command not in ("/addbutton", "/setwelcome", "/done"):
             return
-        if is_owner or (user_id is not None and str(user_id) in admin_ids):
+        if is_admin:
             if edit_admin(bot_token, chat_id, message, update["update_id"], command, database_url, is_owner):
                 return
         reply_to_button(bot_token, chat_id, message.get("text"), database_url)
